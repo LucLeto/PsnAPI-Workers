@@ -91,17 +91,36 @@ Once the refresh token expires, the worker needs a new NPSSO. Getting one means 
 
 1. Sign in to [playstation.com](https://www.playstation.com/) with the burner account.
 2. Open <https://ca.account.sony.com/api/v1/ssocookie> and copy the `npsso` value.
-3. `POST` it to `/admin/npsso` with the admin token:
+3. `POST` it to `/admin/npsso` with the admin token.
+
+   Bash (Linux, macOS, Git Bash):
 
    ```bash
-   read -rs NPSSO   # paste the npsso, it isn't echoed or saved in the shell history
+   read -rs ADMIN_TOKEN   # paste the admin token, it isn't echoed or saved in the shell history
+   read -rs NPSSO         # same for the npsso
    curl -X POST "https://<your-worker>/admin/npsso" \
      -H "Authorization: Bearer $ADMIN_TOKEN" \
      -H "Content-Type: application/json" \
      -d "{\"npsso\":\"$NPSSO\"}"
    ```
 
-A `204` response means the new tokens are stored.
+   PowerShell (Windows PowerShell 5.1 and PowerShell 7):
+
+   ```powershell
+   # Paste each value at the prompt, it isn't echoed or saved in the shell history
+   $admin = [System.Net.NetworkCredential]::new('', (Read-Host 'Admin token' -AsSecureString)).Password
+   $npsso = [System.Net.NetworkCredential]::new('', (Read-Host 'NPSSO' -AsSecureString)).Password
+   Invoke-RestMethod -Method Post -Uri 'https://<your-worker>/admin/npsso' `
+     -Headers @{ Authorization = "Bearer $admin" } `
+     -ContentType 'application/json' `
+     -Body (@{ npsso = $npsso } | ConvertTo-Json)
+   ```
+
+   `read` only exists in Bash. In PowerShell, use `Read-Host` as above.
+
+   Don't type the NPSSO or admin token into the command itself: shells save commands in their history file (`(Get-PSReadLineOption).HistorySavePath` in PowerShell).
+
+A `204` response means the new tokens are stored. In PowerShell, `Invoke-RestMethod` prints nothing on success and throws on an error status.
 
 ## Security
 
