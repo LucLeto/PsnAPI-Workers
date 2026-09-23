@@ -1,0 +1,16 @@
+name = "psnapi-workers"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+
+kv_namespaces = [
+    { binding = "TOKEN_STORE", id = "" },
+#    { binding = "PROFILES_CACHE", id = "" }, # (Optional) Used to reduce responses time
+]
+
+# Daily token renewal and refresh token expiry check
+[triggers]
+crons = ["0 12 * * *"]
+
+# Secrets are set with `wrangler secret put <NAME>`, never in this file:
+# ADMIN_TOKEN = ""   # (Required) Long random string protecting POST /admin/npsso
+# WEBHOOK_URL = ""   # (Optional) Webhook for expiry warnings and error alerts

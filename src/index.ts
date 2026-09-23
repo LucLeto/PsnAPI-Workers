@@ -1,0 +1,253 @@
+import type { IRequest } from 'itty-router'
+
+import { Router, error, text } from 'itty-router'
+import { PsnService } from './psn/service'
+
+export interface Env {
+  TOKEN_STORE?: KVNamespace
+  PROFILES_CACHE?: KVNamespace
+  ADMIN_TOKEN?: string
+  WEBHOOK_URL?: string
+}
+
+// Avatars are served by PSN's resource hosts, so only those can be resized.
+// Anything else would turn /resize into an open image proxy.
+const AVATAR_HOSTS = new Set([
+  'psn-rsc.prod.dl.playstation.net',
+  'static-resource.np.community.playstation.net',
+])
+const AVATAR_EXTENSION = /\.(?:png|jpe?g)$/i
+const RESIZE_CANVAS_WIDTH = 90
+const RESIZE_CANVAS_HEIGHT = 100
+const RESIZE_SIZE_RANGE: [number, number] = [50, RESIZE_CANVAS_WIDTH]
+const TRANSPARENT_CANVAS_URL =
+  'https://placehold.co/90x100/transparent/transparent.png'
+
+const DAY_MS = 24 * 60 * 60 * 1000
+const REFRESH_TOKEN_WARNING_DAYS = 7
+const RENEWAL_STEPS =
+  'Sign in to playstation.com with the burner account, copy `npsso` from https://ca.account.sony.com/api/v1/ssocookie and POST it to /admin/npsso.'
+
+const router = Router()
+
+router
+  .get('/profiles/:accountId', handleProfileRequest)
+  .get('/resize', handleResizeRequest)
+  .post('/admin/npsso', handleNpssoRequest)
+  .get('/robots.txt', () => text('User-agent: *\nDisallow: /'))
+  .all('*', () => error(404))
+
+export default {
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return router.handle(request, env, ctx).catch(async (e: Error) => {
+      console.error(e.toString())
+
+      await sendWebhook(env, `An error occurred on ${request.url}: \`${e}\``)
+
+      return error(500, `Internal server error: ${e}`)
+    })
+  },
+
+  scheduled(
+    controller: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext,
+  ): void {
+    ctx.waitUntil(handleScheduled(env))
+  },
+}
+
+async function handleProfileRequest(request: IRequest, env: Env) {
+  const accountId = request.params?.accountId
+
+  if (!accountId || !/^\d{1,20}$/.test(accountId)) {
+    return error(400, 'Invalid account ID format')
+  }
+
+  const service = await PsnService.create(env)
+  const response = await service.getProfileByAccountId(accountId)
+
+  if (response.invalidAccountId) {
+    return error(400, `Invalid account ID (${response.info})`)
+  }
+
+  if (!response.profile) {
+    return error(404, `User '${accountId}' not found (${response.info})`)
+  }
+
+  return Response.json(response.profile)
+}
+
+// Same output as the Steam and Xbox workers' /resize: a 90x100 transparent PNG
+// with the square avatar centred at `size` pixels, so it can fill a
+// rectangular portrait without being stretched.
+async function handleResizeRequest(request: IRequest) {
+  const { searchParams } = new URL(request.url)
+  const source = searchParams.get('url')
+
+  if (!source) {
+    return error(400, 'Missing image URL')
+  }
+
+  let imageUrl: URL
+
+  try {
+    imageUrl = new URL(source)
+  } catch {
+    return error(400, 'Invalid image URL')
+  }
+
+  if (
+    (imageUrl.protocol !== 'https:' && imageUrl.protocol !== 'http:') ||
+    !AVATAR_HOSTS.has(imageUrl.hostname) ||
+    imageUrl.port !== '' ||
+    !AVATAR_EXTENSION.test(imageUrl.pathname)
+  ) {
+    return error(400, 'Disallowed image URL')
+  }
+
+  const size = parseResizeSize(searchParams.get('size'))
+
+  if (size === null) {
+    return error(400, `Invalid size [${RESIZE_SIZE_RANGE.join('-')}]`)
+  }
+
+  return fetch(TRANSPARENT_CANVAS_URL, {
+    cf: {
+      image: {
+        width: RESIZE_CANVAS_WIDTH,
+        height: RESIZE_CANVAS_HEIGHT,
+        format: 'png',
+        draw: [
+          {
+            url: imageUrl.toString(),
+            width: size,
+            height: size,
+            fit: 'contain',
+            left: Math.floor((RESIZE_CANVAS_WIDTH - size) / 2),
+            top: Math.floor((RESIZE_CANVAS_HEIGHT - size) / 2),
+          },
+        ],
+      },
+    },
+  })
+}
+
+function parseResizeSize(value: string | null): number | null {
+  if (value === null) {
+    return RESIZE_CANVAS_WIDTH
+  }
+
+  const size = Number(value)
+
+  if (
+    !Number.isInteger(size) ||
+    size < RESIZE_SIZE_RANGE[0] ||
+    size > RESIZE_SIZE_RANGE[1]
+  ) {
+    return null
+  }
+
+  return size
+}
+
+async function handleNpssoRequest(request: IRequest, env: Env) {
+  if (!isAdminRequest(request, env)) {
+    return error(401, 'Unauthorized')
+  }
+
+  let body: { npsso?: unknown } | null
+
+  try {
+    body = await request.json()
+  } catch {
+    return error(400, 'Invalid JSON body')
+  }
+
+  const npsso = body?.npsso
+
+  if (typeof npsso !== 'string' || npsso === '') {
+    return error(400, 'Missing npsso')
+  }
+
+  const service = await PsnService.fromNpsso(env, npsso)
+
+  if (!service) {
+    return error(400, 'NPSSO was rejected by PSN')
+  }
+
+  return new Response(null, { status: 204 })
+}
+
+// Constant-time comparison, so the admin token can't be recovered from
+// response timings. Without a configured ADMIN_TOKEN every request is refused.
+function isAdminRequest(request: IRequest, env: Env): boolean {
+  if (!env.ADMIN_TOKEN) {
+    return false
+  }
+
+  const encoder = new TextEncoder()
+  const expected = encoder.encode(`Bearer ${env.ADMIN_TOKEN}`)
+  const actual = encoder.encode(request.headers.get('Authorization') ?? '')
+
+  return (
+    expected.byteLength === actual.byteLength &&
+    crypto.subtle.timingSafeEqual(expected, actual)
+  )
+}
+
+async function handleScheduled(env: Env) {
+  let service: PsnService | undefined
+
+  try {
+    service = await PsnService.create(env)
+    await service.renew()
+  } catch (e) {
+    console.error(`${e}`)
+
+    await sendWebhook(
+      env,
+      `Daily token renewal failed: \`${e}\`\n${RENEWAL_STEPS}`,
+    )
+  }
+
+  if (!service) {
+    return
+  }
+
+  const expire = service.refreshTokenExpire
+  const remaining = expire.getTime() - Date.now()
+
+  if (remaining >= REFRESH_TOKEN_WARNING_DAYS * DAY_MS) {
+    return
+  }
+
+  const status =
+    remaining > 0
+      ? `expires in ${Math.floor(remaining / DAY_MS)} day(s) (${expire.toISOString()})`
+      : `expired on ${expire.toISOString()}`
+
+  await sendWebhook(env, `The PSN refresh token ${status}.\n${RENEWAL_STEPS}`)
+}
+
+// Alerting must never mask the original error, so failures are only logged.
+// The webhook URL is a secret too, so the fetch error itself isn't logged.
+async function sendWebhook(env: Env, content: string) {
+  if (typeof env.WEBHOOK_URL !== 'string') {
+    return
+  }
+
+  try {
+    await fetch(env.WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        content: `**PsnAPI Workers** ${content}`,
+      }),
+    })
+  } catch {
+    console.error('Failed to send webhook')
+  }
+}
