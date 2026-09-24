@@ -103,13 +103,20 @@ export class PsnService {
     const res = await this.fetchProfile(accountId)
 
     if (!res.invalidAccountId) {
-      await this.env.PROFILES_CACHE.put(
-        accountId,
-        JSON.stringify(res.profile ?? null),
-        {
-          expirationTtl: 3600, // 1 hour
-        },
-      )
+      // A failed write, e.g. once the free plan's daily KV write limit is
+      // used up, only costs a cache miss next time, so the profile is still
+      // returned.
+      try {
+        await this.env.PROFILES_CACHE.put(
+          accountId,
+          JSON.stringify(res.profile ?? null),
+          {
+            expirationTtl: 3600, // 1 hour
+          },
+        )
+      } catch (e) {
+        console.error(`Failed to cache profile: ${e}`)
+      }
     }
 
     return res
