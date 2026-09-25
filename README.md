@@ -54,9 +54,11 @@ When `PROFILES_CACHE` is configured, responses (including `404`s) are cached for
 
 ### Resize an avatar
 
-**GET** `/resize?url={avatar}&size={size}`
+**GET** `/resize?url={avatar}&size={size}&background={RRGGBB}`
 
-Returns a 90x100 transparent PNG with the square avatar centred on it at `size` pixels (an integer from 50 to 90, defaults to 90). This is the same output as the Steam and Xbox workers' `/resize`.
+Returns a 90x100 PNG with the square avatar centred on it at `size` pixels (an integer from 50 to 90, defaults to 90). This is the same layout as the Steam and Xbox workers' `/resize`.
+
+The image is opaque. ProfilePictures puts the picture into the icon slot of Darktide's portrait frame material, which ignores transparency, so the padding around the avatar and any transparent parts of the avatar are filled with `background`, and the avatar's edges are blended into it. `background` is six hex digits without `#` (defaults to `000000`, black). Anything else is rejected with a `400`.
 
 `url` must be a percent-encoded avatar URL, otherwise the request is rejected with a `400`:
 * protocol `https:` or `http:`
