@@ -16,7 +16,9 @@ It lets the Darktide mod ProfilePictures show PSN avatars, alongside the [Steam]
 | `TOKEN_STORE` | KV namespace | yes | PSN access and refresh tokens, and the NPSSO they were exchanged from |
 | `PROFILES_CACHE` | KV namespace | no | Profile responses, cached for one hour |
 | `ADMIN_TOKEN` | secret | yes | Protects `POST /admin/npsso` (long random string) |
-| `WEBHOOK_URL` | secret | no | Expiry warnings and error alerts (Discord-compatible `{ "content": … }` payload) |
+| `WEBHOOK_URL` | secret | no | Expiry warnings, usage alerts and error alerts (Discord-compatible `{ "content": … }` payload) |
+| `CF_ACCOUNT_ID` | variable | no | Cloudflare account ID, for the usage alerts |
+| `CF_API_TOKEN` | secret | no | Cloudflare API token with the "Account Analytics: Read" permission, for the usage alerts |
 
 ## Installation
 
@@ -26,8 +28,9 @@ It lets the Darktide mod ProfilePictures show PSN avatars, alongside the [Steam]
 * _(Optional)_ Create a KV namespace named `PROFILES_CACHE` and add its id in the `wrangler.toml`
 * Set the admin token with `npx wrangler secret put ADMIN_TOKEN` (for example the output of `openssl rand -hex 32`)
 * _(Optional)_ Set the webhook with `npx wrangler secret put WEBHOOK_URL`
+* _(Optional)_ For the usage alerts, put your account ID (shown by `npx wrangler whoami`) in `CF_ACCOUNT_ID` in the `wrangler.toml`, create an API token with the "Account Analytics: Read" permission in the Cloudflare dashboard, and set it with `npx wrangler secret put CF_API_TOKEN`
 * Deploy to Workers with `npm run deploy`
-* Store the first NPSSO by following the [renewal routine](#renewal-routine-every-2-months)
+* Store the first NPSSO by following the [renewal routine](#renewal-routine-every-60-days)
 
 ## Endpoints
 
@@ -94,11 +97,21 @@ Measured lifetimes, none of which is extended by using them:
 * A daily Cron Trigger (12:00 UTC) renews the tokens and reads how long the NPSSO has left from `https://ca.account.sony.com/api/v1/ssocookie`. It posts to `WEBHOOK_URL`:
   * when fewer than 7 days are left before the NPSSO expires, as a reminder to renew. Tokens stored before the worker kept the NPSSO use the refresh token's expiry instead, until the next `POST /admin/npsso`.
   * when the daily renewal fails
+* Every 15 minutes, a second Cron Trigger reads today's usage from Cloudflare's GraphQL analytics API and posts to `WEBHOOK_URL`, once per day each:
+  * when fewer than 1,000 of the Workers Free plan's 100,000 daily requests are left
+  * when fewer than 150 of the 1,000 daily KV writes are left
+  * when the usage check itself fails, e.g. because of a wrong `CF_API_TOKEN`
+
+  Both limits count the whole Cloudflare account and reset at 00:00 UTC. The check is skipped without `CF_ACCOUNT_ID` and `CF_API_TOKEN`. Each run logs today's totals, visible with `npx wrangler tail`.
 * Any unhandled error on a request is also posted to `WEBHOOK_URL`.
 
 ## Renewal routine (every 60 days)
 
 Once the NPSSO expires, the worker needs a new one. Getting one means signing in manually. Automating that sign-in is out of scope: it's protected by a CAPTCHA and bot detection, and trying to get around them puts the account and the worker at risk. Sony also refuses sign-ins in a browser controlled by automation tools.
+
+The worker's webhook reminds you daily from 7 days before the NPSSO expires, and links here.
+
+Until it's verified, also run the password test from [Revoking access](#revoking-access) at the renewal: it checks whether a password change cuts off a leaked NPSSO.
 
 1. Sign in to [playstation.com](https://www.playstation.com/) with the burner account, in your own browser.
 2. Open <https://ca.account.sony.com/api/v1/ssocookie> and copy the `npsso` value.
@@ -147,6 +160,22 @@ A `204` response means the new tokens are stored. In PowerShell, `Invoke-RestMet
 * Errors from Sony's sign-in endpoints only report the HTTP status and OAuth error code.
 * `/admin/npsso` accepts `POST` only and compares the admin token in constant time.
 * `robots.txt` disallows everything.
+
+## Revoking access
+
+The worker signs in as the PlayStation App, which doesn't appear in the account's list of approved apps, so its access can't be revoked there. If the admin token, the stored NPSSO or a token might have leaked:
+
+1. **Stop the worker from using them.** Delete what's stored in `TOKEN_STORE`:
+
+   ```bash
+   npx wrangler kv key delete tokens --binding TOKEN_STORE --remote
+   ```
+
+   PSN profile lookups fail from then on, each with a webhook alert, until a new NPSSO is posted. If the admin token leaked, replace it with `npx wrangler secret put ADMIN_TOKEN`.
+
+2. **Invalidate them at Sony.** A leaked NPSSO or refresh token stays valid at Sony until it expires (up to 60 or 10 days), whatever the worker does. Change the burner account's password under Security, and sign out of all devices if Sony offers it there. Then sign in with the new password and follow the [renewal routine](#renewal-routine-every-60-days).
+
+   **Not verified yet:** whether a password change also invalidates the NPSSO and refresh tokens. To confirm it at the next renewal, run `node scripts/check-npsso-renewal.mjs` with the old NPSSO, change the password and run it again. `NPSSO accepted: no` on the second run confirms it.
 
 ## To verify before deploying
 

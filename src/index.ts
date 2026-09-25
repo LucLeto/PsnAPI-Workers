@@ -3,12 +3,15 @@ import type { IRequest } from 'itty-router'
 import { Router, error, text } from 'itty-router'
 import { type Rgb, flattenPng } from './png'
 import { PsnService } from './psn/service'
+import { usageAlerts } from './usage'
 
 export interface Env {
   TOKEN_STORE?: KVNamespace
   PROFILES_CACHE?: KVNamespace
   ADMIN_TOKEN?: string
   WEBHOOK_URL?: string
+  CF_ACCOUNT_ID?: string
+  CF_API_TOKEN?: string
 }
 
 // Avatars are served by PSN's resource hosts, so only those can be resized.
@@ -30,7 +33,12 @@ const DEFAULT_RESIZE_BACKGROUND = '000000'
 const DAY_MS = 24 * 60 * 60 * 1000
 const RENEWAL_WARNING_DAYS = 7
 const RENEWAL_STEPS =
-  'Sign in to playstation.com with the burner account, copy `npsso` from https://ca.account.sony.com/api/v1/ssocookie and POST it to /admin/npsso.'
+  'Sign in to playstation.com with the burner account in your own browser, copy `npsso` from https://ca.account.sony.com/api/v1/ssocookie and run `npm run post-npsso -- <worker URL>`. ' +
+  'Full routine: https://github.com/LucLeto/PsnAPI-Workers#renewal-routine-every-60-days'
+
+// Must match the usage check's cron in wrangler.toml. Any other cron runs the
+// daily renewal, so that one keeps working if its time is changed.
+const USAGE_CHECK_CRON = '*/15 * * * *'
 
 const router = Router()
 
@@ -57,7 +65,11 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): void {
-    ctx.waitUntil(handleScheduled(env))
+    ctx.waitUntil(
+      controller.cron === USAGE_CHECK_CRON
+        ? handleUsageCheck(env, new Date(controller.scheduledTime))
+        : handleScheduled(env),
+    )
   },
 }
 
@@ -279,6 +291,12 @@ async function handleScheduled(env: Env) {
       : `expired on ${expire.toISOString()}`
 
   await sendWebhook(env, `The PSN ${what} ${status}.\n${RENEWAL_STEPS}`)
+}
+
+async function handleUsageCheck(env: Env, now: Date) {
+  for (const message of await usageAlerts(env, now)) {
+    await sendWebhook(env, message)
+  }
 }
 
 // Alerting must never mask the original error, so failures are only logged.
