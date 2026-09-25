@@ -10,3 +10,6 @@ transpiled/
 wrangler.toml
 .dev.vars
 .wrangler/
+
+# Local run log of scripts/check-npsso-renewal.mjs
+scripts/npsso-check-log.json

@@ -98,11 +98,19 @@ Measured lifetimes, none of which is extended by using them:
 
 ## Renewal routine (every 60 days)
 
-Once the NPSSO expires, the worker needs a new one. Getting one means signing in manually. Automating that sign-in is out of scope: it's protected by a CAPTCHA and bot detection, and trying to get around them puts the account and the worker at risk.
+Once the NPSSO expires, the worker needs a new one. Getting one means signing in manually. Automating that sign-in is out of scope: it's protected by a CAPTCHA and bot detection, and trying to get around them puts the account and the worker at risk. Sony also refuses sign-ins in a browser controlled by automation tools.
 
-1. Sign in to [playstation.com](https://www.playstation.com/) with the burner account.
+1. Sign in to [playstation.com](https://www.playstation.com/) with the burner account, in your own browser.
 2. Open <https://ca.account.sony.com/api/v1/ssocookie> and copy the `npsso` value.
-3. `POST` it to `/admin/npsso` with the admin token.
+3. `POST` it to `/admin/npsso` with the admin token. The easiest way is the script in this repository:
+
+   ```bash
+   npm run post-npsso -- https://<your-worker>
+   ```
+
+   It asks for the admin token and the NPSSO at hidden prompts, checks the admin token first, posts the NPSSO and prints until when the sign-in is valid.
+
+   Without Node.js, use curl or PowerShell:
 
    Bash (Linux, macOS, Git Bash):
 
