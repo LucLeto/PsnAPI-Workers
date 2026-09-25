@@ -13,7 +13,7 @@ It lets the Darktide mod ProfilePictures show PSN avatars, alongside the [Steam]
 
 | Name | Kind | Required | Purpose |
 |---|---|---|---|
-| `TOKEN_STORE` | KV namespace | yes | PSN access and refresh tokens |
+| `TOKEN_STORE` | KV namespace | yes | PSN access and refresh tokens, and the NPSSO they were exchanged from |
 | `PROFILES_CACHE` | KV namespace | no | Profile responses, cached for one hour |
 | `ADMIN_TOKEN` | secret | yes | Protects `POST /admin/npsso` (long random string) |
 | `WEBHOOK_URL` | secret | no | Expiry warnings and error alerts (Discord-compatible `{ "content": … }` payload) |
@@ -72,24 +72,33 @@ The image is opaque. ProfilePictures puts the picture into the icon slot of Dark
 
 Requires `Authorization: Bearer {ADMIN_TOKEN}`. The body is `{ "npsso": "…" }`.
 
-The NPSSO is exchanged for tokens straight away, so a bad NPSSO fails here and not on the next profile request.
+The NPSSO is exchanged for tokens straight away, so a bad NPSSO fails here and not on the next profile request. The NPSSO is stored as well, so the worker can exchange it again when the refresh token runs out.
 
-* `204`: tokens stored
+* `204`: tokens and NPSSO stored
 * `400`: body missing `npsso`, or PSN rejected the NPSSO
 * `401`: missing or wrong admin token
 
 ## Tokens and monitoring
 
-* The access token lasts about an hour. It's refreshed automatically shortly before it expires.
-* The refresh token lasts about two months. Every new `refresh_token` and `refresh_token_expires_in` a refresh returns is stored, so if Sony extends the lifetime the worker picks that up without a code change.
-* A daily Cron Trigger (12:00 UTC) renews the access token and checks when the refresh token expires. It posts to `WEBHOOK_URL`:
-  * when fewer than 7 days are left before the refresh token expires, as a reminder to renew
+Measured lifetimes, none of which is extended by using them:
+
+| | Lifetime |
+|---|---|
+| Access token | 1 hour |
+| Refresh token | 10 days from the NPSSO exchange |
+| NPSSO | 60 days from signing in |
+
+* The access token is refreshed automatically shortly before it expires.
+* The refresh token can't be extended, so the worker exchanges the stored NPSSO again when fewer than 3 days are left, or when a refresh fails. Every new `refresh_token` and `refresh_token_expires_in` Sony returns is stored.
+* That works until the NPSSO expires, so a manual renewal is only needed every 60 days.
+* A daily Cron Trigger (12:00 UTC) renews the tokens and reads how long the NPSSO has left from `https://ca.account.sony.com/api/v1/ssocookie`. It posts to `WEBHOOK_URL`:
+  * when fewer than 7 days are left before the NPSSO expires, as a reminder to renew. Tokens stored before the worker kept the NPSSO use the refresh token's expiry instead, until the next `POST /admin/npsso`.
   * when the daily renewal fails
 * Any unhandled error on a request is also posted to `WEBHOOK_URL`.
 
-## Renewal routine (every ~2 months)
+## Renewal routine (every 60 days)
 
-Once the refresh token expires, the worker needs a new NPSSO. Getting one means signing in manually. Automating that sign-in is out of scope: it's protected by a CAPTCHA and bot detection, and trying to get around them puts the account and the worker at risk.
+Once the NPSSO expires, the worker needs a new one. Getting one means signing in manually. Automating that sign-in is out of scope: it's protected by a CAPTCHA and bot detection, and trying to get around them puts the account and the worker at risk.
 
 1. Sign in to [playstation.com](https://www.playstation.com/) with the burner account.
 2. Open <https://ca.account.sony.com/api/v1/ssocookie> and copy the `npsso` value.

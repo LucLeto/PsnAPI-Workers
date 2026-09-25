@@ -27,6 +27,9 @@ export interface ApiProfileResponse {
 export interface PsnServiceCache {
   accessToken: PsnToken | SerializedPsnToken
   refreshToken: PsnToken | SerializedPsnToken
+  // Kept so the worker can exchange it again before the refresh token runs
+  // out. Tokens stored before this existed don't have it.
+  npsso?: PsnToken | SerializedPsnToken
 }
 
 export interface SerializedPsnToken {

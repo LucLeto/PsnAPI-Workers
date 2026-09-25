@@ -1,3 +1,4 @@
+import { addSeconds } from './date'
 import {
   ApiProfileResponse,
   ApiTokenResponse,
@@ -19,6 +20,14 @@ const CLIENT_AUTHORIZATION =
   'Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A='
 const REDIRECT_URI = 'com.scee.psxandroid.scecompcall://redirect'
 const SCOPE = 'psn:mobile.v2.core psn:clientapp'
+const SSO_COOKIE_URL = 'https://ca.account.sony.com/api/v1/ssocookie'
+
+// Measured lifetimes: a refresh token lasts 10 days from the NPSSO exchange
+// and an NPSSO 60 days from sign-in, and neither is extended by use. Exchanging
+// the stored NPSSO again before the refresh token runs out means a manual
+// renewal is only needed when the NPSSO itself expires.
+const NPSSO_FALLBACK_LIFETIME = 60 * 24 * 3600 // when ssocookie doesn't say
+const NPSSO_REEXCHANGE_MARGIN = 3 * 24 * 3600 // leaves the daily cron 3 tries
 
 const PROFILE_BASE_URL =
   'https://m.np.playstation.com/api/userProfile/v1/internal/users'
@@ -38,11 +47,16 @@ export class PsnService {
   private env: Env
   private accessToken: PsnToken
   private refreshToken: PsnToken
+  private npsso?: PsnToken
 
   constructor(env: Env, cache: PsnServiceCache) {
     this.accessToken = PsnToken.deserialize(cache.accessToken)
     this.refreshToken = PsnToken.deserialize(cache.refreshToken)
     this.env = env
+
+    if (cache.npsso) {
+      this.npsso = PsnToken.deserialize(cache.npsso)
+    }
   }
 
   static async create(env: Env): Promise<PsnService> {
@@ -55,35 +69,38 @@ export class PsnService {
     return new PsnService(env, JSON.parse(cached))
   }
 
-  // Exchanges the NPSSO straight away and replaces the stored tokens. Returns
-  // null when PSN rejects the NPSSO.
+  // Exchanges the NPSSO straight away and replaces the stored tokens and
+  // NPSSO. Returns null when PSN rejects the NPSSO.
   static async fromNpsso(env: Env, npsso: string): Promise<PsnService | null> {
     requireTokenStore(env)
 
-    const code = await exchangeNpssoForCode(npsso)
+    const tokens = await exchangeNpsso(npsso)
 
-    if (!code) {
+    if (!tokens) {
       return null
     }
 
-    const [accessToken, refreshToken] = PsnToken.fromTokenResponse(
-      await requestTokens({
-        code,
-        redirect_uri: REDIRECT_URI,
-        grant_type: 'authorization_code',
-        token_format: 'jwt',
-      }),
-    )
-
-    const service = new PsnService(env, { accessToken, refreshToken })
+    const now = new Date()
+    const npssoExpire =
+      (await readNpssoExpiry(npsso)) ?? addSeconds(now, NPSSO_FALLBACK_LIFETIME)
+    const [accessToken, refreshToken] = tokens
+    const service = new PsnService(env, {
+      accessToken,
+      refreshToken,
+      npsso: new PsnToken(npsso, now, npssoExpire),
+    })
 
     await service.cacheService()
 
     return service
   }
 
-  get refreshTokenExpire(): Date {
-    return this.refreshToken.expire
+  // When a manual renewal is needed: the stored NPSSO's expiry, or for tokens
+  // stored without one, the refresh token's
+  get renewalDeadline(): { what: string; expire: Date } {
+    return this.npsso
+      ? { what: 'sign-in (NPSSO)', expire: this.npsso.expire }
+      : { what: 'refresh token', expire: this.refreshToken.expire }
   }
 
   async getProfileByAccountId(accountId: string): Promise<ProfileResponse> {
@@ -122,17 +139,71 @@ export class PsnService {
     return res
   }
 
-  // Refreshes the access token even if it's still valid. The daily cron uses
-  // this so a broken refresh token shows up without waiting for a request.
+  // Run by the daily cron. Updates the stored NPSSO's expiry, exchanges the
+  // NPSSO again when the refresh token is close to running out, and otherwise
+  // refreshes the access token even if it's still valid, so a broken sign-in
+  // shows up without waiting for a request.
   async renew(): Promise<void> {
-    await this.refreshAccessToken()
+    if (this.npsso) {
+      const expire = await readNpssoExpiry(this.npsso.token)
+
+      if (expire) {
+        this.npsso.expire = expire
+      }
+    }
+
+    if (
+      this.canReexchange() &&
+      this.refreshToken.expiresWithin(NPSSO_REEXCHANGE_MARGIN)
+    ) {
+      await this.reexchange()
+    } else {
+      await this.refreshOrReexchange()
+    }
+
     await this.cacheService()
   }
 
   private async auth() {
     if (this.accessToken.expiresWithin(ACCESS_TOKEN_REFRESH_MARGIN)) {
-      await this.renew()
+      await this.refreshOrReexchange()
+      await this.cacheService()
     }
+  }
+
+  // Falls back to exchanging the stored NPSSO again when the refresh token no
+  // longer works, e.g. because it expired between two cron runs
+  private async refreshOrReexchange() {
+    try {
+      await this.refreshAccessToken()
+    } catch (e) {
+      if (!this.canReexchange()) {
+        throw e
+      }
+
+      console.error(`PSN token refresh failed, exchanging the NPSSO: ${e}`)
+
+      await this.reexchange()
+    }
+  }
+
+  private canReexchange() {
+    return this.npsso !== undefined && !this.npsso.isExpired()
+  }
+
+  private async reexchange() {
+    this.requests.push('exchange')
+
+    const tokens = this.npsso && (await exchangeNpsso(this.npsso.token))
+
+    if (!tokens) {
+      throw new Error('The stored NPSSO was rejected by PSN')
+    }
+
+    const [accessToken, refreshToken] = tokens
+
+    this.accessToken = accessToken
+    this.refreshToken = refreshToken
   }
 
   private async fetchProfile(accountId: string): Promise<ProfileResponse> {
@@ -201,6 +272,7 @@ export class PsnService {
     const tokens: PsnServiceCache = {
       accessToken: this.accessToken,
       refreshToken: this.refreshToken,
+      npsso: this.npsso,
     }
 
     return requireTokenStore(this.env).put(
@@ -216,6 +288,54 @@ function requireTokenStore(env: Env): KVNamespace {
   }
 
   return env.TOKEN_STORE
+}
+
+// NPSSO -> authorization code -> access and refresh token. Returns null when
+// PSN rejects the NPSSO.
+async function exchangeNpsso(
+  npsso: string,
+): Promise<[PsnToken, PsnToken] | null> {
+  const code = await exchangeNpssoForCode(npsso)
+
+  if (!code) {
+    return null
+  }
+
+  return PsnToken.fromTokenResponse(
+    await requestTokens({
+      code,
+      redirect_uri: REDIRECT_URI,
+      grant_type: 'authorization_code',
+      token_format: 'jwt',
+    }),
+  )
+}
+
+// The ssocookie endpoint reports the NPSSO's remaining lifetime. Anything
+// unexpected returns null, and the expiry already known is kept.
+async function readNpssoExpiry(npsso: string): Promise<Date | null> {
+  try {
+    const response = await fetch(SSO_COOKIE_URL, {
+      headers: {
+        Cookie: `npsso=${npsso}`,
+        'User-Agent': USER_AGENT,
+      },
+    })
+
+    if (!response.ok) {
+      console.error(`Invalid status from PSN ssocookie: ${response.status}`)
+      return null
+    }
+
+    const json = await response.json<{ expires_in?: unknown }>()
+
+    return typeof json.expires_in === 'number'
+      ? addSeconds(new Date(), json.expires_in)
+      : null
+  } catch (e) {
+    console.error(`Failed to read the NPSSO expiry: ${e}`)
+    return null
+  }
 }
 
 // PSN answers a valid NPSSO with a redirect to the app's custom scheme that

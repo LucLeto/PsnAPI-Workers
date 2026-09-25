@@ -28,7 +28,7 @@ const TRANSPARENT_CANVAS_URL =
 const DEFAULT_RESIZE_BACKGROUND = '000000'
 
 const DAY_MS = 24 * 60 * 60 * 1000
-const REFRESH_TOKEN_WARNING_DAYS = 7
+const RENEWAL_WARNING_DAYS = 7
 const RENEWAL_STEPS =
   'Sign in to playstation.com with the burner account, copy `npsso` from https://ca.account.sony.com/api/v1/ssocookie and POST it to /admin/npsso.'
 
@@ -264,10 +264,12 @@ async function handleScheduled(env: Env) {
     return
   }
 
-  const expire = service.refreshTokenExpire
+  // The worker renews its tokens from the stored NPSSO on its own, so a manual
+  // renewal is only needed before the NPSSO expires
+  const { what, expire } = service.renewalDeadline
   const remaining = expire.getTime() - Date.now()
 
-  if (remaining >= REFRESH_TOKEN_WARNING_DAYS * DAY_MS) {
+  if (remaining >= RENEWAL_WARNING_DAYS * DAY_MS) {
     return
   }
 
@@ -276,7 +278,7 @@ async function handleScheduled(env: Env) {
       ? `expires in ${Math.floor(remaining / DAY_MS)} day(s) (${expire.toISOString()})`
       : `expired on ${expire.toISOString()}`
 
-  await sendWebhook(env, `The PSN refresh token ${status}.\n${RENEWAL_STEPS}`)
+  await sendWebhook(env, `The PSN ${what} ${status}.\n${RENEWAL_STEPS}`)
 }
 
 // Alerting must never mask the original error, so failures are only logged.
