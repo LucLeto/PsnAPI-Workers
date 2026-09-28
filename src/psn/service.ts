@@ -358,7 +358,11 @@ async function exchangeNpssoForCode(npsso: string): Promise<string | null> {
   })
 
   if (response.status < 300 || response.status >= 400) {
-    throw new Error(`Invalid status from PSN authorize: ${response.status}`)
+    throw new Error(
+      `Invalid status from PSN authorize: ${response.status}${describeResponse(
+        response,
+      )}`,
+    )
   }
 
   const location = response.headers.get('location') ?? ''
@@ -387,11 +391,21 @@ async function requestTokens(
     throw new Error(
       `Invalid status from PSN token: ${response.status}${await readOAuthError(
         response,
-      )}`,
+      )}${describeResponse(response)}`,
     )
   }
 
   return response.json<ApiTokenResponse>()
+}
+
+// Tells a block by Sony's edge (e.g. an HTML page from Akamai) apart from a
+// rejection by PSN itself. Only these two headers are reported, never the
+// body or cookies.
+function describeResponse(response: Response): string {
+  const server = response.headers.get('server') ?? 'unknown'
+  const type = response.headers.get('content-type')?.split(';')[0] ?? 'none'
+
+  return ` [server: ${server.slice(0, 64)}, ${type.slice(0, 64)}]`
 }
 
 // Only a standard OAuth error code (e.g. `invalid_grant`) is reported. The rest
