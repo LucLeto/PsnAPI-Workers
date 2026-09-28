@@ -2,7 +2,7 @@ import type { IRequest } from 'itty-router'
 
 import { Router, error, text } from 'itty-router'
 import { type Rgb, flattenPng } from './png'
-import { PsnService } from './psn/service'
+import { PsnAuthError, PsnService } from './psn/service'
 import { usageAlerts } from './usage'
 
 export interface Env {
@@ -36,9 +36,15 @@ const RENEWAL_STEPS =
   'Sign in to playstation.com with the burner account in your own browser, copy `npsso` from https://ca.account.sony.com/api/v1/ssocookie and run `npm run post-npsso -- <worker URL>`. ' +
   'Full routine: https://github.com/LucLeto/PsnAPI-Workers#renewal-routine-every-60-days'
 
-// Must match the usage check's cron in wrangler.toml. Any other cron runs the
-// daily renewal, so that one keeps working if its time is changed.
-const USAGE_CHECK_CRON = '*/15 * * * *'
+// Must match the token refresh and usage check's cron in wrangler.toml. Any
+// other cron runs the daily renewal, so that one keeps working if its time is
+// changed.
+const QUARTER_HOUR_CRON = '*/15 * * * *'
+
+// Single failed refreshes happen when Sony's edge refuses a request, so only
+// this many in a row (45 minutes) are posted
+const REFRESH_FAILURES_KEY = 'refresh-failures'
+const REFRESH_FAILURE_ALERT_AFTER = 3
 
 const router = Router()
 
@@ -54,7 +60,10 @@ export default {
     return router.handle(request, env, ctx).catch(async (e: Error) => {
       console.error(e.toString())
 
-      await sendWebhook(env, `An error occurred on ${request.url}: \`${e}\``)
+      // A failed sign-in is posted by the 15-minute cron once it keeps failing
+      if (!(e instanceof PsnAuthError)) {
+        await sendWebhook(env, `An error occurred on ${request.url}: \`${e}\``)
+      }
 
       return error(500, `Internal server error: ${e}`)
     })
@@ -66,8 +75,11 @@ export default {
     ctx: ExecutionContext,
   ): void {
     ctx.waitUntil(
-      controller.cron === USAGE_CHECK_CRON
-        ? handleUsageCheck(env, new Date(controller.scheduledTime))
+      controller.cron === QUARTER_HOUR_CRON
+        ? Promise.all([
+            handleTokenRefresh(env),
+            handleUsageCheck(env, new Date(controller.scheduledTime)),
+          ])
         : handleScheduled(env),
     )
   },
@@ -291,6 +303,60 @@ async function handleScheduled(env: Env) {
       : `expired on ${expire.toISOString()}`
 
   await sendWebhook(env, `The PSN ${what} ${status}.\n${RENEWAL_STEPS}`)
+}
+
+// Posts once a run of failed refreshes reaches REFRESH_FAILURE_ALERT_AFTER,
+// and once more when the tokens work again. The count stops being written at
+// the threshold, so a long outage doesn't use up the daily KV writes.
+async function handleTokenRefresh(env: Env) {
+  const store = env.TOKEN_STORE
+
+  if (!store) {
+    return
+  }
+
+  const failures = Number((await store.get(REFRESH_FAILURES_KEY)) ?? 0)
+
+  try {
+    const service = await PsnService.create(env)
+    await service.refreshAhead()
+  } catch (e) {
+    console.error(`Token refresh failed: ${e}`)
+
+    if (failures >= REFRESH_FAILURE_ALERT_AFTER) {
+      return
+    }
+
+    try {
+      await store.put(REFRESH_FAILURES_KEY, String(failures + 1))
+    } catch (putError) {
+      console.error(`Failed to store the refresh failure count: ${putError}`)
+    }
+
+    if (failures + 1 === REFRESH_FAILURE_ALERT_AFTER) {
+      await sendWebhook(
+        env,
+        `The PSN token refresh failed ${REFRESH_FAILURE_ALERT_AFTER} times in a row, so profile requests are likely failing too. Last error: \`${e}\`\n` +
+          `An HTML response from Sony's edge is a block on Sony's side that usually clears up by itself. Otherwise, renew the sign-in: ${RENEWAL_STEPS}`,
+      )
+    }
+
+    return
+  }
+
+  if (failures === 0) {
+    return
+  }
+
+  try {
+    await store.delete(REFRESH_FAILURES_KEY)
+  } catch (e) {
+    console.error(`Failed to reset the refresh failure count: ${e}`)
+  }
+
+  if (failures >= REFRESH_FAILURE_ALERT_AFTER) {
+    await sendWebhook(env, 'The PSN token refresh works again.')
+  }
 }
 
 async function handleUsageCheck(env: Env, now: Date) {

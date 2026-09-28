@@ -7,8 +7,8 @@ kv_namespaces = [
 #    { binding = "PROFILES_CACHE", id = "" }, # (Optional) Used to reduce responses time
 ]
 
-# Daily token renewal, and the usage check every 15 minutes (must match
-# USAGE_CHECK_CRON in src/index.ts)
+# Daily token renewal, and the token refresh and usage check every 15 minutes
+# (must match QUARTER_HOUR_CRON in src/index.ts)
 [triggers]
 crons = ["0 12 * * *", "*/15 * * * *"]
 

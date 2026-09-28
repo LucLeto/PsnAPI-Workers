@@ -40,6 +40,19 @@ const TOKEN_STORE_KEY = 'tokens'
 // Refresh a little before the access token expires, so it can't expire
 // between the check and the profile request.
 const ACCESS_TOKEN_REFRESH_MARGIN = 300 // 5 minutes
+// The 15-minute cron refreshes well ahead, so it gets 2 tries before requests
+// have to refresh themselves
+const ACCESS_TOKEN_CRON_REFRESH_MARGIN = 30 * 60
+
+// Sony's edge now and then refuses a sign-in request with a 403 and accepts
+// the same request seconds later, so these statuses are retried
+const RETRY_DELAYS = [1000, 3000]
+
+// A failed sign-in at PSN. Requests only log it, the 15-minute cron alerts
+// once it keeps failing.
+export class PsnAuthError extends Error {
+  name = 'PsnAuthError'
+}
 
 export class PsnService {
   private readonly requests: string[] = []
@@ -139,10 +152,9 @@ export class PsnService {
     return res
   }
 
-  // Run by the daily cron. Updates the stored NPSSO's expiry, exchanges the
-  // NPSSO again when the refresh token is close to running out, and otherwise
-  // refreshes the access token even if it's still valid, so a broken sign-in
-  // shows up without waiting for a request.
+  // Run by the daily cron. Updates the stored NPSSO's expiry and exchanges the
+  // NPSSO again when the refresh token is close to running out. The access
+  // token is left to the 15-minute cron.
   async renew(): Promise<void> {
     if (this.npsso) {
       const expire = await readNpssoExpiry(this.npsso.token)
@@ -157,16 +169,33 @@ export class PsnService {
       this.refreshToken.expiresWithin(NPSSO_REEXCHANGE_MARGIN)
     ) {
       await this.reexchange()
-    } else {
-      await this.refreshOrReexchange()
     }
 
     await this.cacheService()
   }
 
+  // Run by the 15-minute cron, so requests almost never wait for a refresh,
+  // and a broken sign-in shows up without waiting for a request. Returns
+  // whether the access token was refreshed.
+  async refreshAhead(): Promise<boolean> {
+    if (!this.accessToken.expiresWithin(ACCESS_TOKEN_CRON_REFRESH_MARGIN)) {
+      return false
+    }
+
+    await this.refreshOrReexchange()
+    await this.cacheService()
+
+    return true
+  }
+
   private async auth() {
     if (this.accessToken.expiresWithin(ACCESS_TOKEN_REFRESH_MARGIN)) {
-      await this.refreshOrReexchange()
+      try {
+        await this.refreshOrReexchange()
+      } catch (e) {
+        throw new PsnAuthError(e instanceof Error ? e.message : `${e}`)
+      }
+
       await this.cacheService()
     }
   }
@@ -349,13 +378,16 @@ async function exchangeNpssoForCode(npsso: string): Promise<string | null> {
     scope: SCOPE,
   })
 
-  const response = await fetch(`${AUTH_BASE_URL}/authorize?${params}`, {
-    headers: {
-      Cookie: `npsso=${npsso}`,
-      'User-Agent': USER_AGENT,
+  const response = await fetchWithRetry(
+    `${AUTH_BASE_URL}/authorize?${params}`,
+    {
+      headers: {
+        Cookie: `npsso=${npsso}`,
+        'User-Agent': USER_AGENT,
+      },
+      redirect: 'manual',
     },
-    redirect: 'manual',
-  })
+  )
 
   if (response.status < 300 || response.status >= 400) {
     throw new Error(
@@ -377,7 +409,7 @@ async function exchangeNpssoForCode(npsso: string): Promise<string | null> {
 async function requestTokens(
   body: Record<string, string>,
 ): Promise<ApiTokenResponse> {
-  const response = await fetch(`${AUTH_BASE_URL}/token`, {
+  const response = await fetchWithRetry(`${AUTH_BASE_URL}/token`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -396,6 +428,35 @@ async function requestTokens(
   }
 
   return response.json<ApiTokenResponse>()
+}
+
+// A 403 isn't how PSN rejects a credential (a rejected NPSSO is a redirect
+// without a code, a rejected refresh token a 400 `invalid_grant`), so it's
+// retried along with rate limits and server errors
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+): Promise<Response> {
+  for (const delay of RETRY_DELAYS) {
+    const response = await fetch(url, init)
+
+    if (
+      response.status !== 403 &&
+      response.status !== 429 &&
+      response.status < 500
+    ) {
+      return response
+    }
+
+    console.error(
+      `PSN answered ${response.status}${describeResponse(response)}, retrying in ${delay} ms`,
+    )
+
+    await response.body?.cancel()
+    await new Promise((resolve) => setTimeout(resolve, delay))
+  }
+
+  return fetch(url, init)
 }
 
 // Tells a block by Sony's edge (e.g. an HTML page from Akamai) apart from a

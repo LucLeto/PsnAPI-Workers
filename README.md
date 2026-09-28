@@ -91,19 +91,21 @@ Measured lifetimes, none of which is extended by using them:
 | Refresh token | 10 days from the NPSSO exchange |
 | NPSSO | 60 days from signing in |
 
-* The access token is refreshed automatically shortly before it expires.
+* Every 15 minutes, a Cron Trigger refreshes the access token once fewer than 30 minutes are left, so requests almost never wait for a refresh. A request still refreshes it itself when fewer than 5 minutes are left.
 * The refresh token can't be extended, so the worker exchanges the stored NPSSO again when fewer than 3 days are left, or when a refresh fails. Every new `refresh_token` and `refresh_token_expires_in` Sony returns is stored.
 * That works until the NPSSO expires, so a manual renewal is only needed every 60 days.
-* A daily Cron Trigger (12:00 UTC) renews the tokens and reads how long the NPSSO has left from `https://ca.account.sony.com/api/v1/ssocookie`. It posts to `WEBHOOK_URL`:
+* Sony's edge now and then refuses a sign-in request with a 403 and accepts the same request seconds later. Sign-in requests answered with a 403, 429 or 5xx are retried twice, after 1 and 3 seconds.
+* A daily Cron Trigger (12:00 UTC) reads how long the NPSSO has left from `https://ca.account.sony.com/api/v1/ssocookie` and exchanges it again when the refresh token is running out. It posts to `WEBHOOK_URL`:
   * when fewer than 7 days are left before the NPSSO expires, as a reminder to renew. Tokens stored before the worker kept the NPSSO use the refresh token's expiry instead, until the next `POST /admin/npsso`.
   * when the daily renewal fails
-* Every 15 minutes, a second Cron Trigger reads today's usage from Cloudflare's GraphQL analytics API and posts to `WEBHOOK_URL`, once per day each:
+* The 15-minute refresh posts to `WEBHOOK_URL` when it has failed 3 times in a row, and again once it works. The alert shows the `Server` and `Content-Type` of Sony's response: an HTML page from Sony's edge (e.g. `AkamaiGHost`) is a block on Sony's side that usually clears up by itself.
+* The same Cron Trigger reads today's usage from Cloudflare's GraphQL analytics API and posts to `WEBHOOK_URL`, once per day each:
   * when fewer than 1,000 of the Workers Free plan's 100,000 daily requests are left
   * when fewer than 150 of the 1,000 daily KV writes are left
   * when the usage check itself fails, e.g. because of a wrong `CF_API_TOKEN`
 
   Both limits count the whole Cloudflare account and reset at 00:00 UTC. The check is skipped without `CF_ACCOUNT_ID` and `CF_API_TOKEN`. Each run logs today's totals, visible with `npx wrangler tail`.
-* Any unhandled error on a request is also posted to `WEBHOOK_URL`.
+* Any other unhandled error on a request is also posted to `WEBHOOK_URL`. A failed sign-in on a request is only logged, the 15-minute refresh reports it if it keeps failing.
 
 ## Renewal routine (every 60 days)
 
