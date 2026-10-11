@@ -44,8 +44,8 @@ const ACCESS_TOKEN_REFRESH_MARGIN = 300 // 5 minutes
 // have to refresh themselves
 const ACCESS_TOKEN_CRON_REFRESH_MARGIN = 30 * 60
 
-// Sony's edge now and then refuses a sign-in request with a 403 and accepts
-// the same request seconds later, so these statuses are retried
+// Sony's edge now and then refuses a sign-in or profile request with a 403
+// and accepts the same request seconds later, so these statuses are retried
 const RETRY_DELAYS = [1000, 3000]
 
 // A failed sign-in at PSN. Requests only log it, the 15-minute cron alerts
@@ -240,12 +240,15 @@ export class PsnService {
 
     this.requests.push('fetch')
 
-    const response = await fetch(`${PROFILE_BASE_URL}/${accountId}/profiles`, {
-      headers: {
-        Authorization: `Bearer ${this.accessToken.token}`,
-        'User-Agent': USER_AGENT,
+    const response = await fetchWithRetry(
+      `${PROFILE_BASE_URL}/${accountId}/profiles`,
+      {
+        headers: {
+          Authorization: `Bearer ${this.accessToken.token}`,
+          'User-Agent': USER_AGENT,
+        },
       },
-    })
+    )
 
     if (response.status === 404) {
       return { info: '404 response from PSN API' }
@@ -263,8 +266,16 @@ export class PsnService {
         return { invalidAccountId: true, info: 'Rejected by PSN API' }
       }
 
+      // PSN's own JSON errors carry a code worth keeping. An HTML page from
+      // Sony's edge only adds noise to the alert.
+      const details = response.headers.get('content-type')?.includes('json')
+        ? ` - ${body.slice(0, 500)}`
+        : ''
+
       throw new Error(
-        `Invalid status from PSN profile: ${response.status} - ${body}`,
+        `Invalid status from PSN profile: ${response.status}${describeResponse(
+          response,
+        )}${details}`,
       )
     }
 
@@ -431,8 +442,9 @@ async function requestTokens(
 }
 
 // A 403 isn't how PSN rejects a credential (a rejected NPSSO is a redirect
-// without a code, a rejected refresh token a 400 `invalid_grant`), so it's
-// retried along with rate limits and server errors
+// without a code, a rejected refresh token a 400 `invalid_grant`) or an
+// account ID (a 400 or 404), so it's retried along with rate limits and
+// server errors
 async function fetchWithRetry(
   url: string,
   init: RequestInit,

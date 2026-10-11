@@ -94,7 +94,7 @@ Measured lifetimes, none of which is extended by using them:
 * Every 15 minutes, a Cron Trigger refreshes the access token once fewer than 30 minutes are left, so requests almost never wait for a refresh. A request still refreshes it itself when fewer than 5 minutes are left.
 * The refresh token can't be extended, so the worker exchanges the stored NPSSO again when fewer than 3 days are left, or when a refresh fails. Every new `refresh_token` and `refresh_token_expires_in` Sony returns is stored.
 * That works until the NPSSO expires, so a manual renewal is only needed every 60 days.
-* Sony's edge now and then refuses a sign-in request with a 403 and accepts the same request seconds later. Sign-in requests answered with a 403, 429 or 5xx are retried twice, after 1 and 3 seconds.
+* Sony's edge now and then refuses a sign-in or profile request with a 403 and accepts the same request seconds later. Sign-in and profile requests answered with a 403, 429 or 5xx are retried twice, after 1 and 3 seconds.
 * A daily Cron Trigger (12:00 UTC) reads how long the NPSSO has left from `https://ca.account.sony.com/api/v1/ssocookie` and exchanges it again when the refresh token is running out. It posts to `WEBHOOK_URL`:
   * when fewer than 7 days are left before the NPSSO expires, as a reminder to renew. Tokens stored before the worker kept the NPSSO use the refresh token's expiry instead, until the next `POST /admin/npsso`.
   * when the daily renewal fails
